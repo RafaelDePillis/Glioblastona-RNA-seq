@@ -1,0 +1,335 @@
+---
+title: "Gene expression and cancer"
+output:
+  html_document:
+    highlight: espresso
+    theme: lumen
+    toc: yes
+    toc_depth: 3
+  pdf_document:
+    toc: yesa
+    toc_depth: '3'
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+get the neccesary libraries:
+```{r}
+if (!requireNamespace("BiocManager"))
+    install.packages("BiocManager")
+BiocManager::install(c("TCGAbiolinks", "limma", "edgeR", "glmnet", "factoextra", "FactoMineR", "caret","SummarizedExperiment", "gplots", "survival", "survminer", "RColorBrewer", "gProfileR"), force=TRUE)
+```
+
+```{r}
+# Load packages
+library("TCGAbiolinks")
+library("limma")
+library("edgeR")
+library("glmnet")
+library("factoextra")
+library("FactoMineR")
+library("caret")
+library("SummarizedExperiment")
+library("gplots")
+library("survival")
+library("survminer")
+library("RColorBrewer")
+library("gProfileR")
+library("genefilter")
+```
+### TCGA data
+
+Based on:
+https://www.costalab.org/wp-content/uploads/2020/11/R_class_D3.html#2_TCGA_data
+
+```{r}
+GDCprojects = getGDCprojects()
+
+head(GDCprojects[c("project_id", "name")])
+
+```
+
+
+
+```{r}
+TCGAbiolinks:::getProjectSummary("TCGA-GBM")
+```
+
+
+#will start by querying all RNA seq data from GBM project.
+
+```{r}
+query_TCGA = GDCquery(
+    project = "TCGA-GBM",
+    data.category = "Transcriptome Profiling",
+    experimental.strategy = "RNA-Seq",
+    workflow.type = "HTSeq - Counts")
+```
+
+#get results to visualize
+
+```{r}
+lihc_res = getResults(query_TCGA) # make results as table
+head(lihc_res) # data of the first 6 patients.
+colnames(lihc_res) # columns present in the table
+```
+
+
+```{r}
+lihc_res = getResults(query_TCGA) # make results as table
+# head(lihc_res) # data of the first 6 patients.
+colnames(lihc_res) # columns present in the table
+```
+
+```{r}
+head(lihc_res$sample_type) # first 6 types of tissue.
+```
+
+#summary funcitn to visualize because sample types is a factor variable
+
+```{r}
+summary(factor(lihc_res$sample_type)) # summary of distinct tissues types present in this study
+```
+
+
+#5 controls and 156 samples of cancer, will redo sample query because we are going to ignore the recurrent tumors
+
+```{r}
+query_TCGA = GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Transcriptome Profiling", # parameter enforced by GDCquery
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "HTSeq - Counts",
+  sample.type = c("Primary Tumor", "Solid Tissue Normal"))
+```
+```{r}
+GDCdownload(query = query_TCGA)
+#download project data to computer
+tcga_data = GDCprepare(query_TCGA)
+#load project data to R
+#https://www.bioconductor.org/packages/devel/bioc/vignettes/SummarizedExperiment/inst/doc/SummarizedExperiment.html#anatomy-of-a-summarizedexperiment
+#above link explains TCGA_data
+saveRDS(object = tcga_data,
+        file = "tcga_data.RDS",
+        compress = FALSE)
+#in the future working on this just use the command
+tcga_data = readRDS(file = "tcga_data.RDS")
+#to load the data instead of downloading everything again
+```
+
+#load data
+```{r}
+#tcga_data = readRDS(file = "tcga_data.RDS")
+```
+
+# RNA-Seq Normalization
+
+#to do the RNA seq, first normalize the data to get rid of batch effects and other artifacts. to do this will build a pipeline to perform several steps in sequence. Will use limma.
+```{r}
+limma_pipeline = function(
+  tcga_data,
+  condition_variable,
+  reference_group=NULL){
+
+  design_factor = colData(tcga_data)[, condition_variable, drop=T]
+
+  group = factor(design_factor)
+  if(!is.null(reference_group)){group = relevel(group, ref=reference_group)}
+
+  design = model.matrix(~ group)
+
+  dge = DGEList(counts=assay(tcga_data),
+                 samples=colData(tcga_data),
+                 genes=as.data.frame(rowData(tcga_data)))
+
+  # filtering
+  keep = filterByExpr(dge,design)
+  dge = dge[keep,,keep.lib.sizes=FALSE]
+  rm(keep)
+
+  # Normalization (TMM followed by voom)
+  dge = calcNormFactors(dge)
+  v = voom(dge, design, plot=TRUE)
+
+  # Fit model to data given design
+  fit = lmFit(v, design)
+  fit = eBayes(fit)
+
+  # Show top genes
+  topGenes = topTable(fit, coef=ncol(design), number=100, sort.by="p")
+
+  return(
+    list(
+      voomObj=v, # normalized data
+      fit=fit, # fitted model and statistics
+      topGenes=topGenes # the 100 most differentially expressed genes
+    )
+  )
+}
+```
+```{r}
+limma_res = limma_pipeline(
+  tcga_data=tcga_data,
+  condition_variable="definition",
+  reference_group="Solid Tissue Normal"
+)
+saveRDS(object = limma_res,
+        file = "limma_res.RDS",
+        compress = FALSE)
+#this figure compares primary solid tissue to solid tissue normal
+gender_limma_res = limma_pipeline(
+  tcga_data=tcga_data,
+  condition_variable="gender",
+  reference_group="female")
+```
+
+```{r}
+plot_PCA = function(voomObj, condition_variable){
+  group = factor(voomObj$targets[, condition_variable])
+  pca = prcomp(t(voomObj$E))
+  # Take PC1 and PC2 for the plot
+  plot(pca$x[,1:2],col=group, pch=19)
+  # include a legend for points
+  legend("topright", inset=.01, levels(group), pch=10, col=1:length(levels(group)))
+  return(pca)
+}
+res_pca = plot_PCA(limma_res$voomObj, "definition")
+```
+#significant RNA expression between the two groups
+```{r}
+# Transpose and make it into a matrix object
+d_mat = as.matrix(t(limma_res$voomObj$E))
+
+# As before, we want this to be a factor
+d_resp = as.factor(limma_res$voomObj$targets$definition)
+```
+
+```{r}
+# Divide data into training and testing set
+
+# Set (random-number-generator) seed so that results are consistent between runs
+set.seed(42)
+train_ids = createDataPartition(d_resp, p=0.75, list=FALSE)
+
+x_train = d_mat[train_ids, ]
+x_test  = d_mat[-train_ids, ]
+
+y_train = d_resp[train_ids]
+y_test  = d_resp[-train_ids]
+```
+#using machine learnign where 75% of the data is testing and 25% of the data will be used as samples. 
+```{r}
+res = cv.glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 0.5,
+  family = "binomial"
+)
+```
+```{r}
+y_pred = predict(res, newx=x_test, type="class", s="lambda.min")
+confusion_matrix = table(y_pred, y_test)
+
+# Evaluation statistics
+print(confusion_matrix)
+print(paste0("Sensitivity: ",sensitivity(confusion_matrix)))
+print(paste0("Specificity: ",specificity(confusion_matrix)))
+print(paste0("Precision: ",precision(confusion_matrix)))
+# Getting genes that contribute for the prediction
+res_coef = coef(res, s="lambda.min") # the "coef" function returns a sparse matrix
+dim(res_coef)
+head(res_coef) # in a sparse matrix the "." represents the value of zero
+# get coefficients with non-zero values
+res_coef = res_coef[res_coef[,1] != 0,]
+# note how performing this operation changed the type of the variable
+head(res_coef)
+# remove first coefficient as this is the intercept, a variable of the model itself
+res_coef = res_coef[-1]
+
+relevant_genes = names(res_coef) # get names of the (non-zero) variables.
+length(relevant_genes) # number of selected genes
+head(relevant_genes) # few select genes
+head(limma_res$voomObj$genes)
+relevant_gene_names = limma_res$voomObj$genes[relevant_genes,"external_gene_name"]
+
+head(relevant_gene_names) # few select genes (with readable names now)
+print(intersect(limma_res$topGenes$ensembl_gene_id, relevant_genes))
+```
+
+```{r}
+ # define the color palette for the plot
+hmcol = colorRampPalette(rev(brewer.pal(9, "RdBu")))(256)
+
+# perform complete linkage clustering
+clust = function(x) hclust(x, method="complete")
+# use the inverse of correlation as distance.
+dist = function(x) as.dist((1-cor(t(x)))/2)
+
+# Show green color for genes that also show up in DE analysis
+colorLimmaGenes = ifelse(
+  # Given a vector of boolean values
+  (relevant_genes %in% limma_res$topGenes$ensembl_gene_id),
+  "green", # if true, return green for that value
+  "white" # if false, return white for that value
+)
+
+# As you've seen a good looking heatmap involves a lot of parameters
+gene_heatmap = heatmap.2(
+  t(d_mat[,relevant_genes]),
+  scale="row",          # scale the values for each gene (row)
+  density.info="none",  # turns off density plot inside color legend
+  trace="none",         # turns off trace lines inside the heat map
+  col=hmcol,            # define the color map
+  labRow=relevant_gene_names, # use gene names instead of ensembl annotation
+  RowSideColors=colorLimmaGenes,
+  labCol=FALSE,         # Not showing column labels
+  ColSideColors=as.character(as.numeric(d_resp)), # Show colors for each response class
+  dendrogram="both",    # Show dendrograms for both axis
+  hclust = clust,       # Define hierarchical clustering method
+  distfun = dist,       # Using correlation coefficient for distance function
+  cexRow=.6,            # Resize row labels
+  margins=c(1,5)        # Define margin spaces
+)
+```
+#heat map showing which genes are differentially expressed
+```{r}
+# Using the same method as in Day-2, get the dendrogram from the heatmap
+# and cut it to get the 2 classes of genes
+
+# Extract the hierarchical cluster from heatmap to class "hclust"
+hc = as.hclust(gene_heatmap$rowDendrogram)
+
+# Cut the tree into 2 groups, up-regulated in tumor and up-regulated in control
+clusters = cutree(hc, k=2)
+table(clusters)
+# selecting just a few columns so that its easier to visualize the table
+gprofiler_cols = c("significant","p.value","overlap.size","term.id","term.name")
+
+# make sure the URL uses https
+set_base_url("https://biit.cs.ut.ee/gprofiler")
+
+# Group 1, up in tumor
+gprofiler(names(clusters[clusters %in% 1]))[, gprofiler_cols]
+gprofiler(names(clusters[clusters %in% 2]))[, gprofiler_cols]
+```
+```{r}
+# retain only a small subset of the genes (see documentation for ?varFilter)
+d_mat = varFilter(limma_res$voomObj$E, var.func=IQR, var.cutoff=0.95)
+#retain top 5% of dispersion between samples. Get rid of the genes that are similarly expressed in all samples so that we know which ones are most likely to contribute to the differences
+# transpose the matrix, so that it has the same shape as the d_mat we used at the beginning
+d_mat = t(d_mat)
+
+#
+print(dim(d_mat))
+print(dim(x_train))
+print(dim(x_test))
+x_train = d_mat[train_ids, ]
+x_test  = d_mat[-train_ids, ]
+
+# size after
+print(dim(x_train))
+print(dim(x_test))
+```
+
